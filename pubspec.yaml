@@ -1,11 +1,14 @@
 name: voca_youtube_player
-description: "A new Flutter package project."
+description: A lightweight YouTube clip player widget for Flutter.
 version: 0.0.1
-homepage:
+repository: https://github.com/kkaradag2/voca_youtube_player
+homepage: https://github.com/kkaradag2/voca_youtube_player
+issue_tracker: https://github.com/kkaradag2/voca_youtube_player/issues
 
 environment:
-  sdk: ^3.10.8
-  flutter: ">=1.17.0"
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.10.0"
+
 
 dependencies:
   flutter:
