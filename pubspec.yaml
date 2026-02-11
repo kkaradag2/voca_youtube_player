@@ -1,6 +1,6 @@
 name: voca_youtube_player
 description: A lightweight YouTube clip player widget for Flutter.
-version: 0.0.3
+version: 0.0.4
 repository: https://github.com/kkaradag2/voca_youtube_player
 homepage: https://github.com/kkaradag2/voca_youtube_player
 issue_tracker: https://github.com/kkaradag2/voca_youtube_player/issues
