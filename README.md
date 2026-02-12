@@ -19,6 +19,7 @@ flows, and micro-content experiences.
 -   Playback lifecycle callbacks:
     -   `onReadyToPlay`
     -   `onPlaybackStarted`
+    -   `onReplayAvailable`
     -   `onTimerCompleted`
 -   Option to open the video externally (YouTube app or browser)
 
@@ -67,6 +68,9 @@ class ExamplePage extends StatelessWidget {
           },
           onPlaybackStarted: () {
             debugPrint('Playback started');
+          },
+          onReplayAvailable: () {
+            debugPrint('Replay is now available');
           },
           onTimerCompleted: () {
             debugPrint('Clip completed');
@@ -127,6 +131,10 @@ class ExamplePage extends StatelessWidget {
                                                             first visual frame is
                                                             considered started.
 
+  `onReplayAvailable`   `VoidCallback?`   No                Triggered when replay
+                                                            overlay becomes
+                                                            visible at clip end.
+
   `onTimerCompleted`    `VoidCallback?`   No                Triggered when the
                                                             countdown reaches
                                                             zero.
@@ -142,8 +150,32 @@ class ExamplePage extends StatelessWidget {
 4.  When the first visual frame is detected, `onPlaybackStarted` is
     triggered.
 5.  Playback pauses before the full YouTube end-screen recommendations.
-6.  If `timerCount` is greater than zero, countdown begins and
+6.  Replay overlay becomes visible and `onReplayAvailable` is triggered.
+7.  If `timerCount` is greater than zero, countdown begins and
     `onTimerCompleted` is triggered when it reaches zero.
+
+------------------------------------------------------------------------
+
+## Listen Practice Usage
+
+Use `onReplayAvailable` to unlock the next button without timer hacks:
+
+``` dart
+bool _nextUnlocked = false;
+
+VocaPlayer(
+  videoId: clip.videoId,
+  startSeconds: clip.startSeconds,
+  endSeconds: clip.endSeconds,
+  hideAdvice: true,
+  showControls: true,
+  onReplayAvailable: () {
+    setState(() {
+      _nextUnlocked = true;
+    });
+  },
+)
+```
 
 ------------------------------------------------------------------------
 

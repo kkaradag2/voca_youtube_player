@@ -46,6 +46,7 @@ class VocaPlayer extends StatefulWidget {
     this.endHoldBackSeconds = 0.75,
     this.onReadyToPlay,
     this.onPlaybackStarted,
+    this.onReplayAvailable,
     this.onTimerCompleted,
   })  : assert(startSeconds >= 0),
         assert(endSeconds > startSeconds),
@@ -104,6 +105,9 @@ class VocaPlayer extends StatefulWidget {
   /// Called when the first visual frame is considered started.
   final VoidCallback? onPlaybackStarted;
 
+  /// Called when replay becomes available at clip end-hold pause state.
+  final VoidCallback? onReplayAvailable;
+
   /// Called when end countdown reaches zero.
   final VoidCallback? onTimerCompleted;
 
@@ -135,6 +139,7 @@ class VocaPlayerState extends State<VocaPlayer> {
   Completer<void> _readyCompleter = Completer<void>();
   bool _readyNotified = false;
   bool _playbackStartedNotified = false;
+  bool _replayAvailableNotified = false;
   bool _isPlayerVisible = false;
   int _reloadToken = 0;
 
@@ -218,6 +223,7 @@ class VocaPlayerState extends State<VocaPlayer> {
     if (hardReloadNeeded) {
       _readyNotified = false;
       _playbackStartedNotified = false;
+      _replayAvailableNotified = false;
       _isPlayerVisible = false;
       _readyCompleter = Completer<void>();
       _debug(
@@ -256,6 +262,7 @@ class VocaPlayerState extends State<VocaPlayer> {
     if (clipChanged) {
       // Keep the player visible for snappy UX, but allow next visual-ready callback.
       _playbackStartedNotified = false;
+      _resetReplayAvailableNotification('clip_changed');
       _debug('soft_update clip_changed -> playback_started_notify_reset');
     }
     unawaited(
@@ -351,6 +358,7 @@ class VocaPlayerState extends State<VocaPlayer> {
 
   Future<void> play() async {
     _debug('play_requested');
+    _resetReplayAvailableNotification('play_requested');
     try {
       await _readyCompleter.future.timeout(const Duration(seconds: 4));
       await _controller.runJavaScript('window.vocaPlay && window.vocaPlay();');
@@ -380,6 +388,14 @@ class VocaPlayerState extends State<VocaPlayer> {
         }
         if (type == 'visual_ready') {
           _notifyPlaybackStarted(reason.isEmpty ? msg : reason);
+          return;
+        }
+        if (type == 'replay_available') {
+          _notifyReplayAvailable(reason.isEmpty ? msg : reason);
+          return;
+        }
+        if (type == 'replay_cycle_started') {
+          _resetReplayAvailableNotification(reason.isEmpty ? msg : reason);
           return;
         }
         if (type == 'end_timer_done') {
@@ -453,6 +469,19 @@ class VocaPlayerState extends State<VocaPlayer> {
     }
     _debug('first_frame_reveal_callback_fired');
     widget.onPlaybackStarted?.call();
+  }
+
+  void _notifyReplayAvailable(String reason) {
+    if (_replayAvailableNotified) return;
+    _replayAvailableNotified = true;
+    _debug('replay_available reason=$reason');
+    widget.onReplayAvailable?.call();
+  }
+
+  void _resetReplayAvailableNotification(String reason) {
+    if (!_replayAvailableNotified) return;
+    _replayAvailableNotified = false;
+    _debug('replay_available_reset reason=$reason');
   }
 
   void _debug(String message) {
@@ -1123,6 +1152,7 @@ class VocaPlayerState extends State<VocaPlayer> {
           endHoldBackSeconds = Math.max(0, next.endHoldBackSec);
         }
 
+        emitEvent('replay_cycle_started', { reason: 'clip_update' });
         endHoldSent = false;
         visualReadySent = false;
         visualReadyConfirmedLogged = false;
@@ -1242,6 +1272,7 @@ class VocaPlayerState extends State<VocaPlayer> {
 
       function setReplayVisible(visible, reason) {
         if (!replayOverlay || !customControls) return;
+        const wasReplayVisible = replayVisible;
         if (!showControls) {
           replayVisible = false;
           replayOverlay.classList.remove('visible');
@@ -1259,6 +1290,9 @@ class VocaPlayerState extends State<VocaPlayer> {
         replayOverlay.classList.toggle('visible', replayVisible);
         customControls.classList.toggle('ended', replayVisible || replayLocked);
         log('CONTROLS|replay=' + replayVisible + '|reason=' + reason);
+        if (replayVisible && !wasReplayVisible) {
+          emitEvent('replay_available', { reason: reason });
+        }
         if (replayVisible) {
           clearControlsHideTimer();
           setControlsVisible(true, 'replay_visible');
@@ -1763,6 +1797,7 @@ class VocaPlayerState extends State<VocaPlayer> {
           return;
         }
         if (window.__vocaPlayer && window.__vocaPlayer.playVideo) {
+          emitEvent('replay_cycle_started', { reason: 'play_requested' });
           endHoldSent = false;
           setReplayVisible(false, 'play_requested');
           setMenuVisible(false, 'play_requested');
