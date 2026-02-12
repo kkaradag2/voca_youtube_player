@@ -1,11 +1,38 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 
+class VocaPlayerController {
+  Future<void> Function()? _playDelegate;
+
+  Future<void> play() async {
+    final delegate = _playDelegate;
+    if (delegate == null) {
+      throw StateError('VocaPlayerController is not attached to a VocaPlayer.');
+    }
+    await delegate();
+  }
+
+  void _attach({
+    required Future<void> Function() playDelegate,
+  }) {
+    _playDelegate = playDelegate;
+  }
+
+  void _detach() {
+    _playDelegate = null;
+  }
+}
+
 class VocaPlayer extends StatefulWidget {
   const VocaPlayer({
     super.key,
+    this.controller,
     this.appId,
     required this.videoId,
     required this.startSeconds,
@@ -14,19 +41,28 @@ class VocaPlayer extends StatefulWidget {
     this.hideAdvice = false,
     this.showControls = true,
     this.timerCount = 0,
+    this.visualStartOffsetSeconds = 0.8,
+    this.visualRevealExtraSeconds = 0.6,
+    this.endHoldBackSeconds = 0.75,
     this.onReadyToPlay,
     this.onPlaybackStarted,
     this.onTimerCompleted,
-  });
+  })  : assert(startSeconds >= 0),
+        assert(endSeconds > startSeconds),
+        assert(visualStartOffsetSeconds >= 0),
+        assert(visualRevealExtraSeconds >= 0),
+        assert(endHoldBackSeconds >= 0);
 
-  /// Optional app/domain id used to build iframe `origin` and `widget_referrer`.
+  final VocaPlayerController? controller;
+
+  /// Optional absolute origin URL used for iframe `origin` and `widget_referrer`.
   ///
   /// Examples:
-  /// - `com.example.app`
-  /// - `example.com`
   /// - `https://example.com`
+  /// - `http://localhost:8080`
   ///
-  /// If null or empty, `https://localhost` is used.
+  /// If null/empty or not a valid absolute `http(s)` origin URL,
+  /// `https://localhost` is used.
   final String? appId;
 
   /// YouTube video id (for example: `E0BY209ZNEY`).
@@ -53,6 +89,15 @@ class VocaPlayer extends StatefulWidget {
   /// If `<= 0`, countdown is disabled.
   final int timerCount;
 
+  /// Offset added to clip start when deciding first visual readiness threshold.
+  final double visualStartOffsetSeconds;
+
+  /// Extra seconds added to visual readiness threshold logic.
+  final double visualRevealExtraSeconds;
+
+  /// How far before clip end playback is paused for end-hold behavior.
+  final double endHoldBackSeconds;
+
   /// Called once when player becomes ready to start playback.
   final VoidCallback? onReadyToPlay;
 
@@ -69,10 +114,6 @@ class VocaPlayer extends StatefulWidget {
 class VocaPlayerState extends State<VocaPlayer> {
   static const String _debugKey = 'VOCA_DEBUG';
   static const String _watchOnYoutubeTitle = 'Watch on Youtube';
-  static const double _visualStartOffsetSeconds = 0.8;
-  static const double _visualRevealExtraSeconds = 0.6;
-  static const double _endHoldBackSeconds = 0.22;
-  static const int _firstFrameRevealDelayMs = 0;
   static const _UiPreset _uiDefault = _UiPreset(
     maskTopPx: 0,
     maskBottomPx: 0,
@@ -89,31 +130,31 @@ class VocaPlayerState extends State<VocaPlayer> {
     overflowScale: 1.44,
     overflowShiftYpx: 12,
   );
-  static const String _userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-      'AppleWebKit/537.36 (KHTML, like Gecko) '
-      'Chrome/132.0.0.0 Safari/537.36';
 
   late final WebViewController _controller;
+  Completer<void> _readyCompleter = Completer<void>();
   bool _readyNotified = false;
   bool _playbackStartedNotified = false;
-  bool _isPlayerReady = false;
   bool _isPlayerVisible = false;
-  bool _isStartingPlayback = false;
+  int _reloadToken = 0;
 
   String get _appOrigin {
     final raw = widget.appId?.trim() ?? '';
     if (raw.isEmpty) return 'https://localhost';
 
     final uri = Uri.tryParse(raw);
-    if (uri != null && uri.hasScheme && uri.host.isNotEmpty) {
-      final hasNonDefaultPort = uri.hasPort &&
-          !((uri.scheme == 'https' && uri.port == 443) ||
-              (uri.scheme == 'http' && uri.port == 80));
-      final portPart = hasNonDefaultPort ? ':${uri.port}' : '';
-      return '${uri.scheme}://${uri.host}$portPart';
+    final parsed = uri;
+    final isHttpScheme =
+        parsed != null && (parsed.scheme == 'https' || parsed.scheme == 'http');
+    if (isHttpScheme && parsed.host.isNotEmpty) {
+      final hasNonDefaultPort = parsed.hasPort &&
+          !((parsed.scheme == 'https' && parsed.port == 443) ||
+              (parsed.scheme == 'http' && parsed.port == 80));
+      final portPart = hasNonDefaultPort ? ':${parsed.port}' : '';
+      return '${parsed.scheme}://${parsed.host}$portPart';
     }
 
-    return 'https://$raw';
+    return 'https://localhost';
   }
 
   _UiPreset get _ui => widget.hideLogo ? _uiHideLogo : _uiDefault;
@@ -121,17 +162,20 @@ class VocaPlayerState extends State<VocaPlayer> {
   @override
   void initState() {
     super.initState();
+    _attachController();
     _debug(
       'init appId=${widget.appId ?? '(auto)'} origin=$_appOrigin '
       'videoId=${widget.videoId} '
       'start=${widget.startSeconds} end=${widget.endSeconds} '
+      'visualStartOffset=${widget.visualStartOffsetSeconds} '
+      'visualRevealExtra=${widget.visualRevealExtraSeconds} '
+      'endHoldBack=${widget.endHoldBackSeconds} '
       'hideLogo=${widget.hideLogo} hideAdvice=${widget.hideAdvice} '
       'showControls=${widget.showControls} timerCount=${widget.timerCount}',
     );
 
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setUserAgent(_userAgent)
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: (url) => _debug('page_started url=$url'),
@@ -153,7 +197,7 @@ class VocaPlayerState extends State<VocaPlayer> {
 
     final platformController = _controller.platform;
     if (platformController is AndroidWebViewController) {
-      AndroidWebViewController.enableDebugging(true);
+      AndroidWebViewController.enableDebugging(kDebugMode);
       platformController.setMediaPlaybackRequiresUserGesture(false);
       _debug('android_webview_configured gesture=false');
     }
@@ -164,44 +208,159 @@ class VocaPlayerState extends State<VocaPlayer> {
   @override
   void didUpdateWidget(covariant VocaPlayer oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.controller != widget.controller) {
+      oldWidget.controller?._detach();
+      _attachController();
+    }
 
-    final shouldReload = oldWidget.hideLogo != widget.hideLogo ||
+    final hardReloadNeeded =
+        oldWidget.appId != widget.appId || oldWidget.videoId != widget.videoId;
+    if (hardReloadNeeded) {
+      _readyNotified = false;
+      _playbackStartedNotified = false;
+      _isPlayerVisible = false;
+      _readyCompleter = Completer<void>();
+      _debug(
+        'hard_reload '
+        'appId:${oldWidget.appId}->${widget.appId} '
+        'videoId:${oldWidget.videoId}->${widget.videoId}',
+      );
+      _logUiInitialState();
+      unawaited(_reloadHtmlWithDispose());
+      return;
+    }
+
+    final configChanged = oldWidget.hideLogo != widget.hideLogo ||
         oldWidget.hideAdvice != widget.hideAdvice ||
         oldWidget.showControls != widget.showControls ||
-        oldWidget.timerCount != widget.timerCount ||
-        oldWidget.appId != widget.appId ||
-        oldWidget.videoId != widget.videoId ||
-        oldWidget.startSeconds != widget.startSeconds ||
-        oldWidget.endSeconds != widget.endSeconds;
+        oldWidget.timerCount != widget.timerCount;
+    final clipChanged = oldWidget.startSeconds != widget.startSeconds ||
+        oldWidget.endSeconds != widget.endSeconds ||
+        oldWidget.visualStartOffsetSeconds != widget.visualStartOffsetSeconds ||
+        oldWidget.visualRevealExtraSeconds != widget.visualRevealExtraSeconds ||
+        oldWidget.endHoldBackSeconds != widget.endHoldBackSeconds;
+    if (!configChanged && !clipChanged) return;
 
-    if (!shouldReload) return;
-
-    _readyNotified = false;
-    _playbackStartedNotified = false;
-    _isPlayerReady = false;
-    _isPlayerVisible = false;
-    _isStartingPlayback = false;
     _debug(
-      'config_changed '
+      'soft_update '
       'hideLogo:${oldWidget.hideLogo}->${widget.hideLogo} '
       'hideAdvice:${oldWidget.hideAdvice}->${widget.hideAdvice} '
       'showControls:${oldWidget.showControls}->${widget.showControls} '
       'timerCount:${oldWidget.timerCount}->${widget.timerCount} '
-      'videoId:${oldWidget.videoId}->${widget.videoId} '
       'start:${oldWidget.startSeconds}->${widget.startSeconds} '
-      'end:${oldWidget.endSeconds}->${widget.endSeconds}',
+      'end:${oldWidget.endSeconds}->${widget.endSeconds} '
+      'visualStartOffset:${oldWidget.visualStartOffsetSeconds}->${widget.visualStartOffsetSeconds} '
+      'visualRevealExtra:${oldWidget.visualRevealExtraSeconds}->${widget.visualRevealExtraSeconds} '
+      'endHoldBack:${oldWidget.endHoldBackSeconds}->${widget.endHoldBackSeconds}',
     );
-    _logUiInitialState();
-    _controller.loadHtmlString(_buildHtml(), baseUrl: _appOrigin);
+    if (clipChanged) {
+      // Keep the player visible for snappy UX, but allow next visual-ready callback.
+      _playbackStartedNotified = false;
+      _debug('soft_update clip_changed -> playback_started_notify_reset');
+    }
+    unawaited(
+      _applySoftUpdate(configChanged: configChanged, clipChanged: clipChanged),
+    );
+  }
+
+  Future<void> _reloadHtmlWithDispose() async {
+    final token = ++_reloadToken;
+    await _disposeWebContext();
+    if (!mounted || token != _reloadToken) return;
+    await _controller.loadHtmlString(_buildHtml(), baseUrl: _appOrigin);
+  }
+
+  Future<void> _disposeWebContext() async {
+    try {
+      await _controller.runJavaScript(
+        'window.__vocaDispose && window.__vocaDispose();',
+      );
+      _debug('web_dispose_called');
+    } catch (e) {
+      // Best-effort cleanup: continue reload even if current context is gone.
+      _debug('web_dispose_error $e');
+    }
+  }
+
+  Future<void> _applySoftUpdate({
+    required bool configChanged,
+    required bool clipChanged,
+  }) async {
+    if (configChanged) {
+      await _sendConfigUpdate();
+    }
+    if (clipChanged) {
+      await _sendClipUpdate();
+    }
+  }
+
+  Future<void> _sendConfigUpdate() async {
+    final ui = _ui;
+    final payload = <String, Object>{
+      'showControls': widget.showControls,
+      'hideAdvice': widget.hideAdvice,
+      'hideLogo': widget.hideLogo,
+      'timerCount': widget.timerCount < 0 ? 0 : widget.timerCount,
+      'watchOnYoutubeTitle': _watchOnYoutubeTitle,
+      'maskTopPx': ui.maskTopPx,
+      'maskBottomPx': ui.maskBottomPx,
+      'maskBottomRightWidthPx': ui.maskBottomRightWidthPx,
+      'maskBottomRightHeightPx': ui.maskBottomRightHeightPx,
+      'overflowScale': ui.overflowScale,
+      'overflowShiftYpx': ui.overflowShiftYpx,
+    };
+    await _runJsBestEffort(
+      'window.vocaUpdateConfig && window.vocaUpdateConfig(${jsonEncode(payload)});',
+      label: 'config_update_js',
+    );
+  }
+
+  Future<void> _sendClipUpdate() async {
+    final rawStart = widget.startSeconds;
+    final rawEnd = widget.endSeconds;
+    var safeStart = rawStart;
+    if (!safeStart.isFinite || safeStart < 0) {
+      safeStart = 0;
+    }
+    var safeEnd = rawEnd;
+    if (!safeEnd.isFinite || safeEnd <= safeStart) {
+      safeEnd = safeStart + 1;
+    }
+    final payload = <String, Object>{
+      'startSec': safeStart,
+      'playerStartSec': safeStart.floor(),
+      'visualStartSec': safeStart + widget.visualStartOffsetSeconds,
+      'endSec': safeEnd,
+      'visualRevealExtraSec': widget.visualRevealExtraSeconds,
+      'endHoldBackSec': widget.endHoldBackSeconds,
+    };
+    await _runJsBestEffort(
+      'window.vocaUpdateClip && window.vocaUpdateClip(${jsonEncode(payload)});',
+      label: 'clip_update_js',
+    );
+  }
+
+  Future<void> _runJsBestEffort(String script, {required String label}) async {
+    try {
+      await _controller.runJavaScript(script);
+      _debug('$label=ok');
+    } catch (e) {
+      _debug('$label=error $e');
+    }
   }
 
   Future<void> play() async {
     _debug('play_requested');
     try {
+      await _readyCompleter.future.timeout(const Duration(seconds: 4));
       await _controller.runJavaScript('window.vocaPlay && window.vocaPlay();');
       _debug('play_command_sent');
     } catch (e) {
       _debug('play_error $e');
+      try {
+        await _controller
+            .runJavaScript('window.vocaPlay && window.vocaPlay();');
+      } catch (_) {}
       rethrow;
     }
   }
@@ -209,6 +368,29 @@ class VocaPlayerState extends State<VocaPlayer> {
   void _onJsMessage(JavaScriptMessage message) {
     final msg = message.message;
     _debug('js $msg');
+
+    try {
+      final decoded = jsonDecode(msg);
+      if (decoded is Map<String, dynamic>) {
+        final type = decoded['type']?.toString() ?? '';
+        final reason = decoded['reason']?.toString() ?? '';
+        if (type == 'ready') {
+          _notifyReady(reason.isEmpty ? msg : reason);
+          return;
+        }
+        if (type == 'visual_ready') {
+          _notifyPlaybackStarted(reason.isEmpty ? msg : reason);
+          return;
+        }
+        if (type == 'end_timer_done') {
+          _debug('timer_completed reason=${reason.isEmpty ? msg : reason}');
+          widget.onTimerCompleted?.call();
+          return;
+        }
+      }
+    } catch (_) {
+      // Backward-compatible fallback for plain string log/event messages.
+    }
 
     if (msg.startsWith('READY_TO_PLAY|')) {
       _notifyReady(msg);
@@ -252,12 +434,9 @@ class VocaPlayerState extends State<VocaPlayer> {
     if (_readyNotified) return;
     _readyNotified = true;
     _debug('ready_to_play reason=$reason');
-    if (!_isPlayerReady) {
-      setState(() {
-        _isPlayerReady = true;
-      });
-      _debug('start_button_state=ENABLED');
-      _debug('status_text=hazir_beklemede');
+    _debug('player_state=READY');
+    if (!_readyCompleter.isCompleted) {
+      _readyCompleter.complete();
     }
     widget.onReadyToPlay?.call();
   }
@@ -265,101 +444,48 @@ class VocaPlayerState extends State<VocaPlayer> {
   void _notifyPlaybackStarted(String reason) {
     if (_playbackStartedNotified) return;
     _playbackStartedNotified = true;
-    _debug(
-      'first_frame_started reason=$reason '
-      'reveal_delay_ms=$_firstFrameRevealDelayMs',
-    );
-    Future<void>.delayed(
-      const Duration(milliseconds: _firstFrameRevealDelayMs),
-      () {
-        if (!mounted) return;
-        if (!_isPlayerVisible || _isStartingPlayback) {
-          setState(() {
-            _isPlayerVisible = true;
-            _isStartingPlayback = false;
-          });
-          _debug('player_visibility=VISIBLE');
-          _debug('status_text=hazir');
-        }
-        _debug('first_frame_reveal_callback_fired');
-        widget.onPlaybackStarted?.call();
-      },
-    );
+    _debug('first_frame_started reason=$reason');
+    if (!_isPlayerVisible) {
+      setState(() {
+        _isPlayerVisible = true;
+      });
+      _debug('player_visibility=VISIBLE');
+    }
+    _debug('first_frame_reveal_callback_fired');
+    widget.onPlaybackStarted?.call();
   }
 
   void _debug(String message) {
     debugPrint('$_debugKey: PLAYER | $message');
   }
 
-  String get _statusText {
-    if (!_isPlayerReady) return 'hazirlaniyor...';
-    if (_isStartingPlayback && !_isPlayerVisible) {
-      return 'ilk sahne bekleniyor...';
-    }
-    return 'hazir';
-  }
-
   void _logUiInitialState() {
     _debug('player_visibility=HIDDEN');
-    _debug('start_button_state=DISABLED');
-    _debug('status_text=hazirlaniyor...');
+    _debug('player_state=PREPARING');
   }
 
-  Future<void> _onStartPressed() async {
-    _debug('start_button_pressed');
+  void _attachController() {
+    widget.controller?._attach(playDelegate: play);
+  }
 
-    if (!_isPlayerReady) {
-      _debug('start_aborted_not_ready');
-      return;
-    }
-
-    if (_isStartingPlayback) {
-      _debug('start_aborted_already_starting');
-      return;
-    }
-
-    setState(() {
-      _isStartingPlayback = true;
-    });
-    _debug('status_text=ilk_sahne_bekleniyor');
-    _debug('player_visibility=HIDDEN_UNTIL_FIRST_FRAME');
-
-    try {
-      await play();
-      _debug('start_play_command_ok');
-    } catch (e) {
-      setState(() {
-        _isStartingPlayback = false;
-      });
-      _debug('start_play_command_error $e');
-    }
+  @override
+  void dispose() {
+    widget.controller?._detach();
+    unawaited(_disposeWebContext());
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Offstage(
-          offstage: !_isPlayerVisible,
-          child: AspectRatio(
-            aspectRatio: 16 / 9,
-            child: WebViewWidget(controller: _controller),
-          ),
-        ),
-        const SizedBox(height: 16),
-        Align(
-          alignment: Alignment.center,
-          child: ElevatedButton(
-            onPressed: (_isPlayerReady && !_isStartingPlayback)
-                ? _onStartPressed
-                : null,
-            child: const Text('BASLA'),
-          ),
-        ),
-        const SizedBox(height: 8),
-        Align(alignment: Alignment.center, child: Text(_statusText)),
-      ],
+    return AspectRatio(
+      aspectRatio: 16 / 9,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          WebViewWidget(controller: _controller),
+          if (!_isPlayerVisible) const ColoredBox(color: Colors.black),
+        ],
+      ),
     );
   }
 
@@ -369,9 +495,27 @@ class VocaPlayerState extends State<VocaPlayer> {
     final appOrigin = _appOrigin.replaceAll("'", r"\'");
     final videoId = widget.videoId.replaceAll("'", r"\'");
     final watchOnYoutubeTitle = _watchOnYoutubeTitle.replaceAll("'", r"\'");
-    final start = widget.startSeconds.floor();
-    final visualStart = widget.startSeconds + _visualStartOffsetSeconds;
-    final end = widget.endSeconds;
+    final rawStart = widget.startSeconds;
+    final rawEnd = widget.endSeconds;
+    var safeStart = rawStart;
+    if (!safeStart.isFinite || safeStart < 0) {
+      safeStart = 0;
+    }
+    var safeEnd = rawEnd;
+    if (!safeEnd.isFinite || safeEnd <= safeStart) {
+      safeEnd = safeStart + 1;
+    }
+    if (safeStart != rawStart || safeEnd != rawEnd) {
+      _debug(
+        'clip_guard_applied '
+        'rawStart=$rawStart rawEnd=$rawEnd '
+        'safeStart=$safeStart safeEnd=$safeEnd',
+      );
+    }
+    final start = safeStart;
+    final playerStart = safeStart.floor();
+    final visualStart = safeStart + widget.visualStartOffsetSeconds;
+    final end = safeEnd;
     final timerCount = widget.timerCount < 0 ? 0 : widget.timerCount;
 
     return '''
@@ -689,23 +833,24 @@ class VocaPlayerState extends State<VocaPlayer> {
     <script>
       const appOrigin = '$appOrigin';
       const videoId = '$videoId';
-      const startSec = $start;
-      const visualStartSec = $visualStart;
-      const endSec = $end;
-      const visualRevealExtraSec = $_visualRevealExtraSeconds;
-      const preventYoutubeEndScreen = $preventYoutubeEndScreen;
-      const endHoldBackSeconds = $_endHoldBackSeconds;
-      const showControls = ${widget.showControls};
-      const watchOnYoutubeTitle = '$watchOnYoutubeTitle';
-      const endTimerStartSec = $timerCount;
-      const hideLogo = ${widget.hideLogo};
-      const hideAdvice = ${widget.hideAdvice};
-      const maskTopPx = ${ui.maskTopPx};
-      const maskBottomPx = ${ui.maskBottomPx};
-      const maskBottomRightWidthPx = ${ui.maskBottomRightWidthPx};
-      const maskBottomRightHeightPx = ${ui.maskBottomRightHeightPx};
-      const overflowScale = ${ui.overflowScale};
-      const overflowShiftYpx = ${ui.overflowShiftYpx};
+      let startSec = $start;
+      let playerStartSec = $playerStart;
+      let visualStartSec = $visualStart;
+      let endSec = $end;
+      let visualRevealExtraSec = ${widget.visualRevealExtraSeconds};
+      let preventYoutubeEndScreen = $preventYoutubeEndScreen;
+      let endHoldBackSeconds = ${widget.endHoldBackSeconds};
+      let showControls = ${widget.showControls};
+      let watchOnYoutubeTitle = '$watchOnYoutubeTitle';
+      let endTimerStartSec = $timerCount;
+      let hideLogo = ${widget.hideLogo};
+      let hideAdvice = ${widget.hideAdvice};
+      let maskTopPx = ${ui.maskTopPx};
+      let maskBottomPx = ${ui.maskBottomPx};
+      let maskBottomRightWidthPx = ${ui.maskBottomRightWidthPx};
+      let maskBottomRightHeightPx = ${ui.maskBottomRightHeightPx};
+      let overflowScale = ${ui.overflowScale};
+      let overflowShiftYpx = ${ui.overflowShiftYpx};
 
       function log(msg) {
         try {
@@ -713,6 +858,16 @@ class VocaPlayerState extends State<VocaPlayer> {
         } catch (_) {}
         if (window.VocaLog) {
           VocaLog.postMessage(msg);
+        }
+      }
+
+      function emitEvent(type, payload) {
+        if (!window.VocaLog) return;
+        try {
+          const event = Object.assign({ type: type }, payload || {});
+          VocaLog.postMessage(JSON.stringify(event));
+        } catch (e) {
+          log('EVENT_EMIT_ERROR|' + e);
         }
       }
 
@@ -736,6 +891,8 @@ class VocaPlayerState extends State<VocaPlayer> {
       let readySent = false;
       let probeTimer = null;
       let visualReadySent = false;
+      let visualReadyConfirmedLogged = false;
+      let visualReadyConfirmWatchdog = null;
       let visualRevealTimer = null;
       let lastVisualState = null;
       let endHoldSent = false;
@@ -756,9 +913,13 @@ class VocaPlayerState extends State<VocaPlayer> {
       let replayLocked = false;
 
       const tapBlocker = document.getElementById('tapBlocker');
+      const playerHost = document.getElementById('player');
       const customControls = document.getElementById('customControls');
       const replayOverlay = document.getElementById('replayOverlay');
       const endTimerBadge = document.getElementById('endTimerBadge');
+      const maskTop = document.getElementById('maskTop');
+      const maskBottom = document.getElementById('maskBottom');
+      const maskBottomRight = document.getElementById('maskBottomRight');
       const btnPlayPause = document.getElementById('btnPlayPause');
       const btnReplay = document.getElementById('btnReplay');
       const volWrap = document.getElementById('volWrap');
@@ -782,7 +943,211 @@ class VocaPlayerState extends State<VocaPlayer> {
         controlsHideTimer = null;
       }
 
+      function clearVisualReadyConfirmWatchdog() {
+        if (!visualReadyConfirmWatchdog) return;
+        clearTimeout(visualReadyConfirmWatchdog);
+        visualReadyConfirmWatchdog = null;
+      }
+
+      window.__vocaDispose = function() {
+        try {
+          clearControlsHideTimer();
+          if (probeTimer) {
+            clearInterval(probeTimer);
+            probeTimer = null;
+          }
+          if (visualRevealTimer) {
+            clearInterval(visualRevealTimer);
+            visualRevealTimer = null;
+          }
+          clearVisualReadyConfirmWatchdog();
+          if (endTimerInterval) {
+            clearInterval(endTimerInterval);
+            endTimerInterval = null;
+          }
+          if (window.__vocaPlayer && typeof window.__vocaPlayer.destroy === 'function') {
+            window.__vocaPlayer.destroy();
+          }
+          window.__vocaPlayer = null;
+          player = null;
+          log('DISPOSE|ok');
+        } catch (e) {
+          log('DISPOSE|error=' + e);
+        }
+      };
+
+      function applyUiPresetToDom() {
+        if (playerHost) {
+          playerHost.style.top = 'calc(50% - ' + overflowShiftYpx + 'px)';
+          playerHost.style.transform = 'translate(-50%, -50%) scale(' + overflowScale + ')';
+        }
+        if (maskTop) {
+          maskTop.style.height = maskTopPx + 'px';
+        }
+        if (maskBottom) {
+          maskBottom.style.height = maskBottomPx + 'px';
+        }
+        if (maskBottomRight) {
+          maskBottomRight.style.width = maskBottomRightWidthPx + 'px';
+          maskBottomRight.style.height = maskBottomRightHeightPx + 'px';
+        }
+      }
+
+      function applyControlsMode(reason) {
+        if (btnMore) {
+          btnMore.style.display = showControls ? 'inline-block' : 'none';
+        }
+        if (customControls) {
+          customControls.style.display = showControls ? 'block' : 'none';
+        }
+        if (replayOverlay) {
+          replayOverlay.style.display = showControls ? 'flex' : 'none';
+        }
+        if (!showControls) {
+          setMenuVisible(false, reason + '_hide_controls');
+          setReplayVisible(false, reason + '_hide_controls');
+          setControlsVisible(false, reason + '_hide_controls');
+        }
+      }
+
+      function recalculateVisualThreshold() {
+        const clipDuration = Math.max(0, endSec - startSec);
+        let dynamicExtra = visualRevealExtraSec;
+        if (clipDuration > 0 && clipDuration <= 4.0) {
+          dynamicExtra = 0.35;
+        } else if (clipDuration > 4.0 && clipDuration <= 8.0) {
+          dynamicExtra = 0.5;
+        }
+
+        let threshold = visualStartSec + dynamicExtra;
+        if (endSec > 0) {
+          const nearEnd = endSec - 0.8;
+          if (nearEnd > visualStartSec) {
+            threshold = Math.min(threshold, nearEnd);
+          } else {
+            threshold = visualStartSec;
+          }
+        }
+        log(
+          'VISUAL_MONITOR|threshold=' + threshold +
+          '|clip=' + clipDuration +
+          '|extra=' + dynamicExtra
+        );
+        return threshold;
+      }
+
+      function recalculateEndHold(reason) {
+        endHoldAt = Math.max(
+          startSec + 0.2,
+          endSec > 0 ? endSec - endHoldBackSeconds : Number.MAX_SAFE_INTEGER
+        );
+        log(
+          'END_HOLD|enabled=' + preventYoutubeEndScreen +
+          '|holdAt=' + endHoldAt +
+          '|reason=' + reason
+        );
+      }
+
+      window.vocaUpdateConfig = function(next) {
+        if (!next) return;
+        if (typeof next.showControls === 'boolean') showControls = next.showControls;
+        if (typeof next.hideAdvice === 'boolean') {
+          hideAdvice = next.hideAdvice;
+          preventYoutubeEndScreen = next.hideAdvice;
+        }
+        if (typeof next.hideLogo === 'boolean') hideLogo = next.hideLogo;
+        if (typeof next.timerCount === 'number') {
+          endTimerStartSec = Math.max(0, Math.floor(next.timerCount));
+          if (!endTimerActive) {
+            endTimerRemaining = endTimerStartSec;
+            endTimerStarted = false;
+            endTimerDoneSent = false;
+            replayLocked = false;
+          } else {
+            endTimerRemaining = Math.min(endTimerRemaining, endTimerStartSec);
+          }
+        }
+        if (typeof next.watchOnYoutubeTitle === 'string') {
+          watchOnYoutubeTitle = next.watchOnYoutubeTitle;
+        }
+        if (typeof next.maskTopPx === 'number') maskTopPx = next.maskTopPx;
+        if (typeof next.maskBottomPx === 'number') maskBottomPx = next.maskBottomPx;
+        if (typeof next.maskBottomRightWidthPx === 'number') {
+          maskBottomRightWidthPx = next.maskBottomRightWidthPx;
+        }
+        if (typeof next.maskBottomRightHeightPx === 'number') {
+          maskBottomRightHeightPx = next.maskBottomRightHeightPx;
+        }
+        if (typeof next.overflowScale === 'number') overflowScale = next.overflowScale;
+        if (typeof next.overflowShiftYpx === 'number') {
+          overflowShiftYpx = next.overflowShiftYpx;
+        }
+
+        if (btnWatchOnYoutube) {
+          btnWatchOnYoutube.textContent = watchOnYoutubeTitle;
+        }
+        applyUiPresetToDom();
+        applyControlsMode('config_update');
+        renderEndTimer('config_update');
+        recalculateEndHold('config_update');
+        log(
+          'CONFIG_UPDATE|controls=' + showControls +
+          '|hideAdvice=' + hideAdvice +
+          '|hideLogo=' + hideLogo +
+          '|timer=' + endTimerStartSec
+        );
+      };
+
+      window.vocaUpdateClip = function(next) {
+        if (!next) return;
+        if (typeof next.startSec === 'number' && Number.isFinite(next.startSec)) {
+          startSec = Math.max(0, next.startSec);
+        }
+        if (typeof next.playerStartSec === 'number' && Number.isFinite(next.playerStartSec)) {
+          playerStartSec = Math.max(0, Math.floor(next.playerStartSec));
+        }
+        if (typeof next.visualStartSec === 'number' && Number.isFinite(next.visualStartSec)) {
+          visualStartSec = Math.max(startSec, next.visualStartSec);
+        } else {
+          visualStartSec = startSec;
+        }
+        if (typeof next.endSec === 'number' && Number.isFinite(next.endSec)) {
+          endSec = Math.max(startSec + 1, next.endSec);
+        } else {
+          endSec = Math.max(startSec + 1, endSec);
+        }
+        if (typeof next.visualRevealExtraSec === 'number' && Number.isFinite(next.visualRevealExtraSec)) {
+          visualRevealExtraSec = Math.max(0, next.visualRevealExtraSec);
+        }
+        if (typeof next.endHoldBackSec === 'number' && Number.isFinite(next.endHoldBackSec)) {
+          endHoldBackSeconds = Math.max(0, next.endHoldBackSec);
+        }
+
+        endHoldSent = false;
+        visualReadySent = false;
+        visualReadyConfirmedLogged = false;
+        clearVisualReadyConfirmWatchdog();
+        recalculateEndHold('clip_update');
+        if (visualRevealTimer) {
+          clearInterval(visualRevealTimer);
+          visualRevealTimer = null;
+        }
+        try {
+          const st = player && player.getPlayerState ? player.getPlayerState() : -1;
+          if (st === 1 && player && typeof player.seekTo === 'function') {
+            player.seekTo(startSec, true);
+            log('CLIP_UPDATE|seek_while_playing=' + startSec);
+          }
+        } catch (_) {}
+        log(
+          'CLIP_UPDATE|start=' + startSec +
+          '|visualStart=' + visualStartSec +
+          '|end=' + endSec
+        );
+      };
+
       function setMenuVisible(visible, reason) {
+        if (!ytMenu) return;
         if (!showControls) {
           menuVisible = false;
           ytMenu.classList.remove('visible');
@@ -869,15 +1234,14 @@ class VocaPlayerState extends State<VocaPlayer> {
             if (!endTimerDoneSent) {
               endTimerDoneSent = true;
               log('END_TIMER|done|reason=' + reason);
-              if (window.VocaLog) {
-                VocaLog.postMessage('END_TIMER_DONE|reason=' + reason);
-              }
+              emitEvent('end_timer_done', { reason: reason });
             }
           }
         }, 1000);
       }
 
       function setReplayVisible(visible, reason) {
+        if (!replayOverlay || !customControls) return;
         if (!showControls) {
           replayVisible = false;
           replayOverlay.classList.remove('visible');
@@ -1153,15 +1517,8 @@ class VocaPlayerState extends State<VocaPlayer> {
           });
         }
 
-        if (btnMore) {
-          btnMore.style.display = showControls ? 'inline-block' : 'none';
-        }
-        if (customControls) {
-          customControls.style.display = showControls ? 'block' : 'none';
-        }
-        if (replayOverlay) {
-          replayOverlay.style.display = showControls ? 'flex' : 'none';
-        }
+        applyUiPresetToDom();
+        applyControlsMode('init');
 
         setMenuVisible(false, 'init');
         setReplayVisible(false, 'init');
@@ -1177,6 +1534,7 @@ class VocaPlayerState extends State<VocaPlayer> {
         if (readySent) return;
         readySent = true;
         log('READY_TO_PLAY|' + reason);
+        emitEvent('ready', { reason: reason });
         if (probeTimer) {
           clearInterval(probeTimer);
           probeTimer = null;
@@ -1185,59 +1543,64 @@ class VocaPlayerState extends State<VocaPlayer> {
 
       function startProbe() {
         if (probeTimer) return;
+        let fastUntil = Date.now() + 2000;
+
         probeTimer = setInterval(function() {
           if (!player || typeof player.getPlayerState !== 'function') return;
           const state = player.getPlayerState();
           let loaded = 0;
-          if (typeof player.getVideoLoadedFraction === 'function') {
-            loaded = player.getVideoLoadedFraction() || 0;
-          }
+          try {
+            loaded = player.getVideoLoadedFraction
+              ? (player.getVideoLoadedFraction() || 0)
+              : 0;
+          } catch (_) {}
           log('PROBE|state=' + state + '|loaded=' + loaded);
           if (state === 5 || state === 2 || state === 1 || loaded > 0) {
             markReady('probe_state=' + state + '_loaded=' + loaded);
+            return;
           }
-        }, 1000);
+
+          if (Date.now() > fastUntil) {
+            clearInterval(probeTimer);
+            probeTimer = setInterval(function() {
+              if (!player || !player.getPlayerState) return;
+              const st2 = player.getPlayerState();
+              let ld2 = 0;
+              try {
+                ld2 = player.getVideoLoadedFraction
+                  ? (player.getVideoLoadedFraction() || 0)
+                  : 0;
+              } catch (_) {}
+              log('PROBE|state=' + st2 + '|loaded=' + ld2);
+              if (st2 === 5 || st2 === 2 || st2 === 1 || ld2 > 0) {
+                markReady('probe_state=' + st2 + '_loaded=' + ld2);
+              }
+            }, 1000);
+          }
+        }, 200);
       }
 
       function markVisualReady(reason) {
         if (visualReadySent) return;
         visualReadySent = true;
+        clearVisualReadyConfirmWatchdog();
+        if (reason === 'optimistic_state_playing') {
+          visualReadyConfirmWatchdog = setTimeout(function() {
+            if (!visualReadyConfirmedLogged) {
+              log('VISUAL_READY_TIMEOUT|reason=optimistic_no_confirm_800ms');
+            }
+            clearVisualReadyConfirmWatchdog();
+          }, 800);
+        }
         log('VISUAL_READY|' + reason);
+        emitEvent('visual_ready', { reason: reason });
       }
 
       function startVisualRevealMonitor() {
         if (visualRevealTimer) return;
 
-        const clipDuration = Math.max(0, endSec - startSec);
-        let dynamicExtra = visualRevealExtraSec;
-        if (clipDuration > 0 && clipDuration <= 4.0) {
-          dynamicExtra = 0.35;
-        } else if (clipDuration > 4.0 && clipDuration <= 8.0) {
-          dynamicExtra = 0.5;
-        }
-
-        let threshold = visualStartSec + dynamicExtra;
-        if (endSec > 0) {
-          const nearEnd = endSec - 0.8;
-          if (nearEnd > visualStartSec) {
-            threshold = Math.min(threshold, nearEnd);
-          } else {
-            threshold = visualStartSec;
-          }
-        }
-        log(
-          'VISUAL_MONITOR|threshold=' + threshold +
-          '|clip=' + clipDuration +
-          '|extra=' + dynamicExtra
-        );
-        endHoldAt = Math.max(
-          startSec + 0.2,
-          endSec > 0 ? endSec - endHoldBackSeconds : Number.MAX_SAFE_INTEGER
-        );
-        log(
-          'END_HOLD|enabled=' + preventYoutubeEndScreen +
-          '|holdAt=' + endHoldAt
-        );
+        const threshold = recalculateVisualThreshold();
+        recalculateEndHold('visual_monitor_start');
 
         visualRevealTimer = setInterval(function() {
           if (!player || typeof player.getPlayerState !== 'function') return;
@@ -1249,18 +1612,20 @@ class VocaPlayerState extends State<VocaPlayer> {
             log('VISUAL_MONITOR|state=' + state + '|time=' + t.toFixed(2));
           }
           if (state === 1 && t >= threshold) {
+            if (!visualReadyConfirmedLogged) {
+              visualReadyConfirmedLogged = true;
+              clearVisualReadyConfirmWatchdog();
+              log('VISUAL_READY_CONFIRMED|time=' + t.toFixed(2) + '|threshold=' + threshold);
+            }
             markVisualReady('state=1|time=' + t.toFixed(2) + '|threshold=' + threshold);
           }
           if (preventYoutubeEndScreen && state === 1 && !endHoldSent && t >= endHoldAt) {
             endHoldSent = true;
             try {
-              if (typeof player.seekTo === 'function') {
-                player.seekTo(endHoldAt, true);
-              }
               if (typeof player.pauseVideo === 'function') {
                 player.pauseVideo();
               }
-              log('END_HOLD|paused_at=' + t.toFixed(2) + '|target=' + endHoldAt.toFixed(2));
+              log('END_HOLD|paused_at=' + t.toFixed(2) + '|target=' + endHoldAt.toFixed(2) + '|no_seek=1');
               uiPlayState = false;
               updatePlayIcon();
               setReplayVisible(true, 'end_hold_pause');
@@ -1280,7 +1645,7 @@ class VocaPlayerState extends State<VocaPlayer> {
         const playerVars = {
           autoplay: 0,
           controls: 0,
-          start: startSec,
+          start: playerStartSec,
           playsinline: 1,
           rel: 0,
           modestbranding: 1,
@@ -1292,7 +1657,7 @@ class VocaPlayerState extends State<VocaPlayer> {
           widget_referrer: appOrigin
         };
         if (!preventYoutubeEndScreen && endSec > 0) {
-          playerVars.end = endSec;
+          playerVars.end = Math.floor(endSec);
         } else {
           log('END_HOLD|manual_end_guard=ON');
         }
@@ -1329,22 +1694,17 @@ class VocaPlayerState extends State<VocaPlayer> {
                 uiPlayState = true;
                 updatePlayIcon();
                 setReplayVisible(false, 'state_playing');
+                markVisualReady('optimistic_state_playing');
               }
               if (event.data === 0 && preventYoutubeEndScreen) {
                 log('EVENT|ended_detected');
                 if (!endHoldSent) {
                   endHoldSent = true;
                   try {
-                    const fallbackTarget = endSec > 0
-                        ? Math.max(startSec + 0.2, endSec - endHoldBackSeconds)
-                        : 0;
-                    if (fallbackTarget > 0 && typeof player.seekTo === 'function') {
-                      player.seekTo(fallbackTarget, true);
-                    }
                     if (typeof player.pauseVideo === 'function') {
                       player.pauseVideo();
                     }
-                    log('END_HOLD|recovered_from_ended|target=' + fallbackTarget.toFixed(2));
+                    log('END_HOLD|recovered_from_ended|no_seek=1');
                     uiPlayState = false;
                     updatePlayIcon();
                     setReplayVisible(true, 'state_ended_recovered');
@@ -1384,6 +1744,18 @@ class VocaPlayerState extends State<VocaPlayer> {
         window.__vocaPlayer = player;
       }
 
+      function shouldSeekToStart(currentTime) {
+        const eps = 0.20;
+        if (currentTime < startSec - eps) return true;
+        if (currentTime > startSec + 0.60) return true;
+        const restartThreshold = Math.max(
+          startSec + 0.2,
+          endSec > 0 ? endSec - Math.max(endHoldBackSeconds, 0.4) : Number.MAX_SAFE_INTEGER
+        );
+        if (currentTime >= restartThreshold) return true;
+        return false;
+      }
+
       window.vocaPlay = function() {
         if (replayLocked) {
           log('ACTION|play_blocked_replay_locked');
@@ -1395,6 +1767,23 @@ class VocaPlayerState extends State<VocaPlayer> {
           setReplayVisible(false, 'play_requested');
           setMenuVisible(false, 'play_requested');
           setControlsVisible(false, 'play_requested');
+          let currentTime = 0;
+          try {
+            if (window.__vocaPlayer.getCurrentTime) {
+              currentTime = window.__vocaPlayer.getCurrentTime() || 0;
+            }
+            if (window.__vocaPlayer.seekTo && shouldSeekToStart(currentTime)) {
+              window.__vocaPlayer.seekTo(startSec, true);
+              log(
+                'ACTION|seekTo=' + startSec +
+                '|from=' + currentTime.toFixed(2)
+              );
+            } else {
+              log('ACTION|seek_skipped|t=' + currentTime.toFixed(2));
+            }
+          } catch (e) {
+            log('ACTION|play_context_error=' + e);
+          }
           try {
             if (window.__vocaPlayer.unMute) {
               window.__vocaPlayer.unMute();
@@ -1411,30 +1800,29 @@ class VocaPlayerState extends State<VocaPlayer> {
 
           window.__vocaPlayer.playVideo();
           log('ACTION|playVideo_unmuted');
-          if (window.__vocaPlayer.seekTo) {
-            setTimeout(function() {
-              try {
-                window.__vocaPlayer.seekTo(visualStartSec, true);
-                log('ACTION|seekTo=' + visualStartSec);
-              } catch (e) {
-                log('ACTION|seekTo_error=' + e);
-              }
-            }, 90);
-          }
-          startVisualRevealMonitor();
         } else {
           log('ACTION|playVideo_skipped_player_not_ready');
         }
       };
 
-      const tag = document.createElement('script');
-      tag.src = 'https://www.youtube.com/iframe_api';
-      document.head.appendChild(tag);
+      function ensureIframeApiLoaded() {
+        if (window.YT && window.YT.Player) {
+          log('EVENT|iframe_api_already_loaded');
+          buildPlayer(ytHost);
+          return;
+        }
+        if (document.getElementById('yt-iframe-api')) return;
+        const tag = document.createElement('script');
+        tag.id = 'yt-iframe-api';
+        tag.src = 'https://www.youtube.com/iframe_api';
+        document.head.appendChild(tag);
+      }
 
       window.onYouTubeIframeAPIReady = function() {
         log('EVENT|iframe_api_ready|origin=' + appOrigin);
         buildPlayer(ytHost);
       };
+      ensureIframeApiLoaded();
     </script>
   </body>
 </html>
